@@ -1,0 +1,10 @@
+# Ignore Arduino temporary files
+build/
+*.hex
+*.elf
+*.bin
+*.o
+
+# Ignore system files
+.DS_Store
+Thumbs.db
