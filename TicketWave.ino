@@ -1504,20 +1504,20 @@ void load_settings() {
   lv_obj_t* prn_dot = lv_obj_create(prn_cont);
   lv_obj_set_size(prn_dot, 12, 12);
   lv_obj_set_style_radius(prn_dot, LV_RADIUS_CIRCLE, 0);
-  bool prn_ok = is_printer_connected();
-  lv_obj_set_style_bg_color(prn_dot, prn_ok ? C_SUCCESS : C_ERROR, 0);
+  PrinterState p_state = get_printer_state();
+  lv_color_t dot_color = C_ERROR; 
+  if (p_state == PrinterState::READY) {
+      dot_color = C_SUCCESS;
+  } else if (p_state == PrinterState::SCANNING || p_state == PrinterState::CONNECTING) {
+      dot_color = lv_color_make(245, 158, 11); // Amber warning color
+  }
+  lv_obj_set_style_bg_color(prn_dot, dot_color, 0);
   lv_obj_set_style_border_width(prn_dot, 0, 0);
 
   lv_obj_t* prn_txt = lv_label_create(prn_cont);
   lv_obj_add_style(prn_txt, &theme.label_body, 0);
-
-  if (prn_ok) {
-    // Show the actual MAC address when connected
-    lv_label_set_text_fmt(prn_txt, "Printer: %s", get_printer_mac());
-  } else {
-    // Show "Offline" or the target MAC we are looking for
-    lv_label_set_text_fmt(prn_txt, "Printer: %s (Offline)", get_printer_mac());
-  }
+  
+  lv_label_set_text_fmt(prn_txt, "Printer: %s", get_printer_state_str());
 
   lv_scr_load(scr_settings);
   if (old_scr) lv_obj_del_async(old_scr);
@@ -1548,22 +1548,27 @@ static void on_prn_manual_save(lv_event_t* e) {
   if (ta_prn_mac) {
     String manual_mac = lv_textarea_get_text(ta_prn_mac);
     manual_mac.trim();
+    manual_mac.toUpperCase();
 
     if (manual_mac.length() > 0) {
-      // 1. Save and trigger the RESET in printer_manager
+      // Try to save it (backend will reject if invalid)
       save_printer_mac(manual_mac);
 
-      // 2. Show a connecting overlay
-      lv_obj_t* mb = lv_msgbox_create(NULL, "Printer", "MAC Saved. Connecting...", NULL, false);
-      lv_obj_center(mb);
+      // Check if the backend accepted it
+      if (String(get_printer_mac()) == manual_mac) {
+        lv_obj_t* mb = lv_msgbox_create(NULL, "Printer", "MAC Saved. Connecting...", NULL, false);
+        lv_obj_center(mb);
 
-      // 3. Close and return to dashboard after 1.5 seconds
-      lv_timer_create([](lv_timer_t* t) {
-        lv_obj_t* m = (lv_obj_t*)t->user_data;
-        if (lv_obj_is_valid(m)) lv_msgbox_close(m);
-        load_printer_settings();
-      },
-                      1500, mb);
+        lv_timer_create([](lv_timer_t* t) {
+          lv_obj_t* m = (lv_obj_t*)t->user_data;
+          if (lv_obj_is_valid(m)) lv_msgbox_close(m);
+          load_printer_settings();
+        }, 1500, mb);
+      } else {
+        // Validation failed!
+        lv_obj_t* mb = lv_msgbox_create(NULL, "Error", "Invalid MAC format!\nMust be XX:XX:XX:XX:XX:XX", NULL, true);
+        lv_obj_center(mb);
+      }
     }
   }
 }
@@ -1737,7 +1742,8 @@ void load_printer_scan() {
   // TODO: Trigger your backend BLE Scan here
   start_ble_scan();
 
-  prn_scan_timer = lv_timer_create(async_prn_scan_cb, 500, nullptr);
+  // Give the background scanner 2 seconds to find devices before showing the list
+  prn_scan_timer = lv_timer_create(async_prn_scan_cb, 2000, nullptr);
 
   lv_scr_load(scr_prn_scan);
   if (old_scr) lv_obj_del_async(old_scr);
@@ -1764,11 +1770,20 @@ void load_printer_settings() {
   lv_obj_t* dot = lv_obj_create(stat_card);
   lv_obj_set_size(dot, 20, 20);
   lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(dot, is_printer_connected() ? C_SUCCESS : C_ERROR, 0);
+  PrinterState p_state = get_printer_state();
+  lv_color_t dot_color = C_ERROR; 
+  if (p_state == PrinterState::READY) {
+      dot_color = C_SUCCESS;
+  } else if (p_state == PrinterState::SCANNING || p_state == PrinterState::CONNECTING) {
+      dot_color = lv_color_make(245, 158, 11); // Amber warning color
+  }
+  lv_obj_set_style_bg_color(dot, dot_color, 0);
 
   lv_obj_t* lbl_stat = lv_label_create(stat_card);
   lv_obj_add_style(lbl_stat, &theme.label_title, 0);
-  lv_label_set_text(lbl_stat, is_printer_connected() ? "CONNECTED" : "DISCONNECTED");
+  
+  // This automatically shows "Scanning", "Ready", "Connecting", or "Error"
+  lv_label_set_text(lbl_stat, get_printer_state_str());
 
   lv_obj_t* lbl_mac = lv_label_create(stat_card);
   lv_obj_add_style(lbl_mac, &theme.label_muted, 0);
