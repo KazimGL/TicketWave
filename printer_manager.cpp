@@ -1,52 +1,24 @@
-/*
- * printer_manager.cpp  — TicketWave Smart Kiosk @kaiz
- *
- * Refactored BLE printer driver with:
- *   • Explicit state machine  (IDLE → SCANNING → CONNECTING → READY / ERROR)
- *   • Filtered scan (target service UUID + "printer" name heuristic)
- *   • High-speed NimBLE handshake (MTU 512, fast connection interval)
- *   • Automatic watchdog — reconnects silently on link loss
- *   • MAC address format validation before persistence
- *   • All UI-facing data updated atomically via String copies so the
- *     LVGL main-thread can read them safely without a mutex
- *@kaiz
- * NOTE: ESC/POS formatting and QR printing are deliberately preserved
- *       exactly as they were in the original implementation.
- */
-
 #include "printer_manager.hpp"
 #include <NimBLEDevice.h>
 #include <SPIFFS.h>
 #include <time.h>
 
-// ================================================================
-// Configuration
-// ================================================================
 #define PRINTER_CONFIG_FILE "/printer_mac.txt"
-#define SCAN_DURATION_SECS 0  // 0 = continuous until stopped
+#define SCAN_DURATION_SECS 0  
 #define CONNECT_TIMEOUT_MS 10000
-#define WATCHDOG_RETRY_MS 3000  // checked in printer_task loop
+#define WATCHDOG_RETRY_MS 3000  
 
-// Target service + characteristic UUIDs (SPP-like BLE serial)
 static const NimBLEUUID kServiceUUID("49535343-fe7d-4ae5-8fa9-9fafd205e455");
 static const NimBLEUUID kCharUUID("49535343-8841-43f4-a8d4-ecbe34729bb3");
 
-// ================================================================
-// Module-private state
-// ================================================================
 static volatile PrinterState g_state = PrinterState::IDLE;
-static String g_target_mac = "";    // Configured MAC to seek
-static String g_scan_results = "";  // Roller-ready string
+static String g_target_mac = "";    
+static String g_scan_results = "";  
 
 static NimBLEAdvertisedDevice* g_adv_device = nullptr;
 static NimBLEClient* g_client = nullptr;
 static NimBLERemoteCharacteristic* g_chr = nullptr;
 
-// ================================================================
-// Helpers
-// ================================================================
-
-/** Validate XX:XX:XX:XX:XX:XX format. */
 static bool is_valid_mac(const String& mac) {
   if (mac.length() != 17) return false;
   for (int i = 0; i < 17; i++) {
@@ -60,33 +32,16 @@ static bool is_valid_mac(const String& mac) {
   return true;
 }
 
-/** Does this advertised device look like a thermal printer? */
-static bool is_likely_printer(const NimBLEAdvertisedDevice* dev) {
-  // Match 1: Advertises our known service UUID
-  if (dev->isAdvertisingService(kServiceUUID)) return true;
-
-  // Match 2: Name contains common printer keywords (case-insensitive)
-  String name = dev->getName().c_str();
-  name.toLowerCase();
-  if (name.indexOf("print") != -1) return true;
-  if (name.indexOf("pos") != -1) return true;
-  if (name.indexOf("58mm") != -1) return true;
-  if (name.indexOf("80mm") != -1) return true;
-  if (name.indexOf("rpp") != -1) return true;  // common brand prefix
-  if (name.indexOf("xp-") != -1) return true;  // XPrinter
-  if (name.indexOf("mpt") != -1) return true;  // mobile printer
-
-  return false;
-}
-
-// ================================================================
-// Scan Callbacks
-// ================================================================
+// ------------------------------------------------------------------------
+// SCAN CALLBACKS
+// ------------------------------------------------------------------------
 class PrinterScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* dev) override {
     String mac = dev->getAddress().toString().c_str();
     String name = dev->getName().c_str();
-    if (name.isEmpty()) name = "Unknown";
+    
+    // If the device has no name, give it a placeholder
+    if (name.isEmpty()) name = "Unknown Device";
 
     // --- Auto-connect path: target MAC matched ---
     if (g_target_mac != "" && mac.equalsIgnoreCase(g_target_mac) && g_state == PrinterState::SCANNING) {
@@ -97,39 +52,33 @@ class PrinterScanCallbacks : public NimBLEScanCallbacks {
       return;
     }
 
-    // --- UI listing path: only printer-like devices ---
-    if (!is_likely_printer(dev)) return;
+    // 👉 THE HEURISTIC FILTER HAS BEEN REMOVED HERE 👈
+    // Now EVERY discovered BLE device will be added to the UI list.
 
-    // Deduplicate by MAC before appending
+    // Deduplicate by MAC before appending to the UI list string
     if (g_scan_results.indexOf(mac) == -1) {
       if (g_scan_results.length() > 0) g_scan_results += "\n";
       g_scan_results += name + " (" + mac + ")";
-      Serial.printf("[PRINTER] Printer found: %s  %s\n",
-                    name.c_str(), mac.c_str());
+      Serial.printf("[BLE SCAN] Device found: %s  %s\n", name.c_str(), mac.c_str());
     }
   }
 
   void onScanEnd(const NimBLEScanResults& /*results*/, int /*reason*/) override {
     Serial.println("[PRINTER] Scan ended.");
-    // If we are still SCANNING (no target found), remain in SCANNING so
-    // the watchdog in printer_task can restart the scan automatically.
   }
 };
 
 static PrinterScanCallbacks g_scan_cbs;
 
-// ================================================================
-// NimBLE Connection
-// ================================================================
+// ------------------------------------------------------------------------
+// CONNECTION LOGIC
+// ------------------------------------------------------------------------
 static bool connect_to_printer() {
   if (!g_adv_device) return false;
 
   Serial.println("[PRINTER] Initiating handshake...");
 
   g_client = NimBLEDevice::createClient();
-
-  // Connection parameters tuned for high-throughput receipt printing
-  // Interval 10–20 ms, latency 0, supervision 500 ms
   g_client->setConnectionParams(8, 16, 0, 500);
   g_client->setConnectTimeout(CONNECT_TIMEOUT_MS);
 
@@ -140,12 +89,10 @@ static bool connect_to_printer() {
     return false;
   }
 
-  // ---- High-speed MTU exchange ----
-  delay(500);               // Let link settle
-  g_client->exchangeMTU();  // Request largest viable MTU
+  delay(500);               
+  g_client->exchangeMTU();  
   delay(300);
 
-  // Discover service
   NimBLERemoteService* svc = g_client->getService(kServiceUUID);
   if (!svc) {
     Serial.println("[PRINTER] ❌ Service not found.");
@@ -155,7 +102,6 @@ static bool connect_to_printer() {
     return false;
   }
 
-  // Discover characteristic
   g_chr = svc->getCharacteristic(kCharUUID);
   if (!g_chr || !g_chr->canWrite()) {
     Serial.println("[PRINTER] ❌ Writable characteristic not found.");
@@ -170,9 +116,6 @@ static bool connect_to_printer() {
   return true;
 }
 
-// ================================================================
-// State Machine Transitions
-// ================================================================
 static void transition_to_idle() {
   g_state = PrinterState::IDLE;
   g_adv_device = nullptr;
@@ -198,12 +141,10 @@ static void disconnect_client() {
   g_adv_device = nullptr;
 }
 
-// ================================================================
-// Public API
-// ================================================================
-
+// ------------------------------------------------------------------------
+// PUBLIC API
+// ------------------------------------------------------------------------
 void init_printer() {
-  // Load saved target MAC
   if (SPIFFS.exists(PRINTER_CONFIG_FILE)) {
     File f = SPIFFS.open(PRINTER_CONFIG_FILE, FILE_READ);
     if (f) {
@@ -215,13 +156,13 @@ void init_printer() {
   }
 
   NimBLEDevice::init("ESP32-S3-KIOSK");
-  NimBLEDevice::setMTU(512);               // Set the desired MTU size globally here
-  NimBLEDevice::setPower(ESP_PWR_LVL_P9);  // Max TX power for range
+  NimBLEDevice::setMTU(512);               
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);  
 
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&g_scan_cbs, false);
   scan->setActiveScan(true);
-  scan->setInterval(97);  // ms — slightly off-beat to avoid BLE congestion
+  scan->setInterval(97);  
   scan->setWindow(48);
 
   if (g_target_mac != "") {
@@ -248,8 +189,7 @@ void save_printer_mac(String new_mac) {
   new_mac.toUpperCase();
 
   if (!is_valid_mac(new_mac)) {
-    Serial.printf("[PRINTER] ⚠️ Invalid MAC format rejected: '%s'\n",
-                  new_mac.c_str());
+    Serial.printf("[PRINTER] ⚠️ Invalid MAC format rejected: '%s'\n", new_mac.c_str());
     return;
   }
 
@@ -264,11 +204,11 @@ void save_printer_mac(String new_mac) {
     Serial.println("[PRINTER] ❌ Could not write MAC to SPIFFS.");
   }
 
-  force_printer_reconnect();  // Immediately attempt to find the new target
+  force_printer_reconnect();  
 }
 
 void start_ble_scan() {
-  g_scan_results = "";  // Clear previous listing
+  g_scan_results = "";  
   NimBLEDevice::getScan()->stop();
   vTaskDelay(pdMS_TO_TICKS(200));
   NimBLEDevice::getScan()->start(SCAN_DURATION_SECS, false);
@@ -302,29 +242,21 @@ const char* get_printer_state_str() {
   return "Unknown";
 }
 
-// ================================================================
-// Printer Task  (runs on Core 0 via xTaskCreatePinnedToCore)
-// ================================================================
 void printer_task(void* /*pvParameters*/) {
-  vTaskDelay(pdMS_TO_TICKS(3000));  // Let system settle after boot
+  vTaskDelay(pdMS_TO_TICKS(3000));  
 
   for (;;) {
     switch (g_state) {
-
-      // ---- IDLE: nothing to do ----
       case PrinterState::IDLE:
         break;
 
-      // ---- SCANNING: wait for ScanCallbacks to fire ----
       case PrinterState::SCANNING:
-        // Watchdog: restart scan if it died without finding target
         if (g_target_mac != "" && !NimBLEDevice::getScan()->isScanning()) {
           Serial.println("[PRINTER] Scan stopped unexpectedly — restarting.");
           NimBLEDevice::getScan()->start(SCAN_DURATION_SECS, false);
         }
         break;
 
-      // ---- CONNECTING: perform handshake ----
       case PrinterState::CONNECTING:
         NimBLEDevice::getScan()->stop();
         if (connect_to_printer()) {
@@ -334,7 +266,6 @@ void printer_task(void* /*pvParameters*/) {
         }
         break;
 
-      // ---- READY: monitor link health ----
       case PrinterState::READY:
         if (!g_client || !g_client->isConnected()) {
           Serial.println("[PRINTER] Link lost — reconnecting.");
@@ -343,7 +274,6 @@ void printer_task(void* /*pvParameters*/) {
         }
         break;
 
-      // ---- ERROR: brief back-off then try again ----
       case PrinterState::ERROR:
         vTaskDelay(pdMS_TO_TICKS(WATCHDOG_RETRY_MS));
         Serial.println("[PRINTER] Watchdog retry.");
@@ -354,14 +284,10 @@ void printer_task(void* /*pvParameters*/) {
         }
         break;
     }
-
     vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
-// ================================================================
-// QR Code Helper  — preserved exactly from original
-// ================================================================
 static void send_qr_to_printer(const String& data) {
   if (!g_chr) return;
 
@@ -392,11 +318,8 @@ static void send_qr_to_printer(const String& data) {
   g_chr->writeValue(left_align, sizeof(left_align), false);
 }
 
-// ================================================================
-// Receipt Printing  — ESC/POS layout and chunk logic preserved
-// ================================================================
 void print_receipt(const char* order_id,
-                   uint32_t amount,
+                   uint32_t    amount,
                    const char* bill_type,
                    const char* details) {
   if (!is_printer_connected() || g_chr == nullptr) {
@@ -404,7 +327,6 @@ void print_receipt(const char* order_id,
     return;
   }
 
-  // Timestamp
   struct tm timeinfo;
   char time_str[24];
   if (!getLocalTime(&timeinfo)) {
@@ -413,7 +335,6 @@ void print_receipt(const char* order_id,
     strftime(time_str, sizeof(time_str), "%d-%m-%Y %H:%M", &timeinfo);
   }
 
-  // Build ESC/POS text block  (layout intentionally unchanged)
   char buf[768];
   snprintf(buf, sizeof(buf),
            "--------------------------------\n"
@@ -423,10 +344,10 @@ void print_receipt(const char* order_id,
            "Time:     %s\n"
            "--------------------------------\n"
            "Category: %s\n"
-           "   Items               Amount   \n"
+           "  Items              Amount   \n"
            "%s\n"
            "--------------------------------\n"
-           "   TOTAL:            Rs. %5u   \n"
+           "  TOTAL:            Rs. %5u   \n"
            "--------------------------------\n"
            "Status:   PAID (SUCCESS)\n"
            "--------------------------------\n"
@@ -435,7 +356,6 @@ void print_receipt(const char* order_id,
            "--------------------------------\n\n\n",
            order_id, time_str, bill_type, details, (unsigned int)amount);
 
-  // Chunked write — essential for stability with low-cost printers
   size_t length = strlen(buf);
   size_t offset = 0;
   while (offset < length) {
@@ -445,7 +365,6 @@ void print_receipt(const char* order_id,
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 
-  // QR payload
   char qr_payload[512];
   snprintf(qr_payload, sizeof(qr_payload),
            "SIGNATURE: BXR-SEC-07\nORDER: %s\nITEMS: %s\nTOTAL: Rs. %u\nVERIFIED AT TICKETWAVE",
@@ -453,7 +372,6 @@ void print_receipt(const char* order_id,
 
   send_qr_to_printer(String(qr_payload));
 
-  // Paper feed
   byte feed[] = { 0x1B, 0x64, 0x06 };
   g_chr->writeValue(feed, sizeof(feed), false);
 
